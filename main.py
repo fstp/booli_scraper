@@ -3,8 +3,10 @@ import logging
 import re
 from string import Template
 
+# from extruct import JsonLdExtractor
+import extruct
+from bs4 import BeautifulSoup
 from curl_cffi import requests
-from extruct import JsonLdExtractor
 from glom import SKIP, glom
 from rich import print_json
 from rich.logging import RichHandler
@@ -15,11 +17,11 @@ logging.basicConfig(
     level="INFO",
     format=FORMAT,
     datefmt="[%X]",
-    handlers=[RichHandler(show_level=False)],
+    handlers=[RichHandler()],
 )
 log = logging.getLogger("rich")
 
-jslde = JsonLdExtractor()
+# jslde = JsonLdExtractor()
 
 cookie = "didomi_token=eyJ1c2VyX2lkIjoiMTkyZjY2MGUtYzM1Ni02ZGVlLTliZGItZGJmNmM1YjZjNDJkIiwiY3JlYXRlZCI6IjIwMjQtMTEtMDRUMDg6NTM6MjAuMDUzWiIsInVwZGF0ZWQiOiIyMDI0LTExLTA0VDA4OjUzOjIyLjUyOFoiLCJ2ZW5kb3JzIjp7ImVuYWJsZWQiOlsiZ29vZ2xlIiwiYzppbnRlcmNvbSIsImM6Ym9vbGktSkFEeUQ4NmUiXX0sInB1cnBvc2VzIjp7ImVuYWJsZWQiOlsiZ2VvbG9jYXRpb25fZGF0YSIsInByZXN0YW5kYSJdfSwidmVyc2lvbiI6MiwiYWMiOiJDS1dBRUJFa0VVb0EuQUFBQSJ9; booli_tracking_consent=true; euconsent-v2=CQHkJEAQHkJEAAHABBENBNFoAP_AAAAAACQgF5wBwAPAAyAGiAP0AiIBigF5gAAAHLQAYAAgqIIAAFIAMAAQVECQAYAAgqIOgAwABBUQhABgACCohKADAAEFRAAA.f_gAAAAAAAAA; booli_visitor=192f660e-c356-6dee-9bdb-dbf6c5b6c42d; BooliHasAbot=false; none; booli_has_bot=false; booli_session=5d57843d-e861-4f37-aa4d-a4c0182a5411"
 headers = {
@@ -483,11 +485,11 @@ def get_detailed_info(id: int) -> str:
 
 
 stockholm_24_rooms = Template(
-    "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=3,4&page=$page"
+    "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=3,4&page=$page&searchType=slutpriser"
 )
 
 start_date = "2020-01-01"
-end_date = "2021-01-01"
+end_date = "2020-12-31"
 page = 469
 
 r = requests.get(
@@ -496,28 +498,48 @@ r = requests.get(
     headers=headers,
 )
 r.raise_for_status()
-data = jslde.extract(r.text)
+# data = jslde.extract(r.text)
+# data = extruct.extract(r.text)
 
 log.info(f"extracted data")
-pprint(data)
+# pprint(data)
+
+soup = BeautifulSoup(r.text, "html.parser")
+script_tags = soup.find_all("script", type="application/json")
+
+if len(script_tags) == 1:
+    # json_data = json.loads(script_tags[0].text)
+    # print_json(json_data)
+    # pprint(script_tags[0].text)
+    json_data = json.loads(script_tags[0].text)
+    gloomed = glom(json_data, "props.pageProps.__APOLLO_STATE__")
+    filtered_data = {k: v for k, v in gloomed.items() if k.startswith("SoldProperty")}
+
+    with open("data.json", "w", encoding="utf-8") as file:
+        pretty_json = json.dumps(filtered_data, indent=4, ensure_ascii=False)
+        file.write(pretty_json)
+
+    print_json(pretty_json)
+else:
+    log.error("No script tags found")
+
+
+# urls = glom(
+#     data,
+#     ("0.itemListElement.*.url", [lambda x: x if "annons" not in x else SKIP]),
+# )
+# ids = []
+# for url in urls:
+#     pprint(url)
+#     id = re.search(r"(\d+)$", url)
+#     if id is not None:
+#         ids.append(id.group(1))
+
+# pprint(ids)
+
+
+# json_data: str = get_detailed_info(4043678)
 # print_json(json_data)
-
-urls = glom(
-    data,
-    ("0.itemListElement.*.url", [lambda x: x if "annons" not in x else SKIP]),
-)
-ids = []
-for url in urls:
-    pprint(url)
-    id = re.search(r"(\d+)$", url)
-    if id is not None:
-        ids.append(id.group(1))
-
-pprint(ids)
-
-
-json_data: str = get_detailed_info(4043678)
-print_json(json_data)
 
 
 # r = requests.get(
