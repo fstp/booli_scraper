@@ -1,13 +1,11 @@
 import json
 import logging
-import re
 from string import Template
 
-# from extruct import JsonLdExtractor
-import extruct
 from bs4 import BeautifulSoup
 from curl_cffi import requests
-from glom import SKIP, glom
+from glom import Assign, Coalesce, T, assign, delete, glom
+from pymongo import MongoClient
 from rich import print_json
 from rich.logging import RichHandler
 from rich.pretty import pprint
@@ -174,304 +172,14 @@ def get_detailed_info(id: int) -> str:
                   name
                   url
                   thumbnail
-                  __typename
                 }
                 agent {
                   id
                   name
                   image
                   premium
-                  __typename
                 }
-                soldPrice {
-                  formatted
-                  raw
-                  value
-                  unit
-                  __typename
-                }
-                streetAddress
-                soldSqmPrice {
-                  formatted
-                  __typename
-                }
-                soldPriceAbsoluteDiff {
-                  formatted
-                  __typename
-                }
-                soldPricePercentageDiff {
-                  formatted
-                  raw
-                  __typename
-                }
-                listPrice {
-                  formatted
-                  __typename
-                }
-                livingArea {
-                  formatted
-                  __typename
-                }
-                rooms {
-                  formatted
-                  __typename
-                }
-                floor {
-                  value
-                  __typename
-                }
-                objectType
-                descriptiveAreaName
-                location {
-                  region {
-                    municipalityName
-                    __typename
-                  }
-                  __typename
-                }
-                soldPriceType
-                daysActive
-                soldDate
-                latitude
-                longitude
-                url
-                __typename
               }
-              __typename
-            }
-            ... on Listing {
-              id
-              booliId
-              blockedImages
-              descriptiveAreaName
-              location {
-                region {
-                  municipalityName
-                  __typename
-                }
-                __typename
-              }
-              daysActive
-              published
-              livingArea {
-                formatted
-                __typename
-              }
-              listPrice {
-                formatted
-                value
-                unit
-                raw
-                __typename
-              }
-              listSqmPrice {
-                formatted
-                __typename
-              }
-              latitude
-              longitude
-              daysActive
-              primaryImage {
-                id
-                alt
-                __typename
-              }
-              objectType
-              rent {
-                formatted
-                raw
-                __typename
-              }
-              operatingCost {
-                raw
-                __typename
-              }
-              estimate {
-                price {
-                  value
-                  unit
-                  raw
-                  formatted
-                  __typename
-                }
-                __typename
-              }
-              rooms {
-                formatted
-                __typename
-              }
-              floor {
-                value
-                __typename
-              }
-              streetAddress
-              url
-              isNewConstruction
-              biddingOpen
-              upcomingSale
-              mortgageDeed
-              tenureForm
-              plotArea {
-                formatted
-                __typename
-              }
-              amenities {
-                key
-                label
-                __typename
-              }
-              nextShowing {
-                startTime
-                __typename
-              }
-              __typename
-            }
-            ... on SoldProperty {
-              id
-              booliId
-              amenities {
-                key
-                label
-                __typename
-              }
-              agency {
-                id
-                name
-                url
-                thumbnail
-                __typename
-              }
-              agent {
-                id
-                name
-                image
-                premium
-                __typename
-              }
-              soldPrice {
-                formatted
-                raw
-                value
-                unit
-                __typename
-              }
-              streetAddress
-              soldSqmPrice {
-                formatted
-                __typename
-              }
-              soldPriceAbsoluteDiff {
-                formatted
-                __typename
-              }
-              soldPricePercentageDiff {
-                formatted
-                raw
-                __typename
-              }
-              listPrice {
-                formatted
-                __typename
-              }
-              livingArea {
-                formatted
-                __typename
-              }
-              rooms {
-                formatted
-                __typename
-              }
-              floor {
-                value
-                __typename
-              }
-              objectType
-              descriptiveAreaName
-              soldPriceType
-              daysActive
-              soldDate
-              latitude
-              longitude
-              url
-              location {
-                region {
-                  municipalityName
-                  __typename
-                }
-                __typename
-              }
-              __typename
-            }
-            ... on ResidenceWithSoldProperty {
-              id
-              booliId
-              agency {
-                id
-                name
-                url
-                thumbnail
-                __typename
-              }
-              agent {
-                id
-                name
-                image
-                premium
-                __typename
-              }
-              soldPrice {
-                formatted
-                raw
-                value
-                unit
-                __typename
-              }
-              streetAddress
-              soldSqmPrice {
-                formatted
-                __typename
-              }
-              soldPriceAbsoluteDiff {
-                formatted
-                __typename
-              }
-              soldPricePercentageDiff {
-                formatted
-                raw
-                __typename
-              }
-              listPrice {
-                formatted
-                __typename
-              }
-              livingArea {
-                formatted
-                __typename
-              }
-              rooms {
-                formatted
-                __typename
-              }
-              floor {
-                value
-                __typename
-              }
-              objectType
-              descriptiveAreaName
-              soldPriceType
-              daysActive
-              soldDate
-              latitude
-              longitude
-              url
-              location {
-                region {
-                  municipalityName
-                  __typename
-                }
-                __typename
-              }
-              __typename
             }
           }
         }""",
@@ -488,6 +196,7 @@ stockholm_24_rooms = Template(
     "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=3,4&page=$page&searchType=slutpriser"
 )
 
+collection = "sold_2020"
 start_date = "2020-01-01"
 end_date = "2020-12-31"
 page = 469
@@ -519,9 +228,87 @@ if len(script_tags) == 1:
         pretty_json = json.dumps(filtered_data, indent=4, ensure_ascii=False)
         file.write(pretty_json)
 
-    print_json(pretty_json)
+    documents = []
+
+    for k, v in filtered_data.items():
+        # delete(v, "__typename", ignore_missing=True)
+        # delete(v, "*.__typename", ignore_missing=True)
+        # assign(v, "id", int(v["id"]))
+        # assign(v, "_id", v["id"])
+        spec = {
+            "_id": ("id", T, int),
+            "id": ("id", T, int),
+            "amenities": "amenities",
+            "sold_price": "soldPrice.raw",
+            "street_address": "streetAddress",
+            "sold_sqm_price": "soldSqmPrice.formatted",
+            "sold_price_absolute_diff": Coalesce(
+                "soldPriceAbsoluteDiff.formatted", default=None
+            ),
+            "sold_price_percentage_diff": Coalesce(
+                "soldPricePercentageDiff.formatted", default=None
+            ),
+            "list_price": Coalesce("listPrice.formatted", default=None),
+            "living_area": "livingArea.formatted",
+            "rooms": "rooms.formatted",
+            "floor": Coalesce("floor.value", default=None),
+            "area_name": "descriptiveAreaName",
+            "days_active": "daysActive",
+            "sold_date": "soldDate",
+            "latitude": "latitude",
+            "longitude": "longitude",
+            "url": "url",
+        }
+        v = glom(v, spec)
+        detailed_info = json.loads(get_detailed_info(v["id"]))
+        agents = glom(detailed_info, ("data.object.salesOfResidence", ["agent"]))
+        v["agents"] = agents
+        documents.append(v)
+
+    pprint(documents)
 else:
     log.error("No script tags found")
+
+# detailed_info = json.loads(get_detailed_info(3368476))
+# di_spec = {"agent": ("data.object.salesOfResidence", ["agent"])}
+
+
+def save_to_mongo(documents, collection):
+    mongo_uri = "mongodb://root:root@localhost:27017/"
+    db_name = "booli"
+    collection_name = "sold_2020"
+
+    # documents = [
+    #     {"_id": 1, "name": "Alice", "age": 30},
+    #     {"_id": 2, "name": "Bob", "age": 25},
+    #     {"_id": 3, "name": "Charlie", "age": 35},
+    #     {
+    #         "_id": 1,
+    #         "name": "Updated Alice",
+    #         "age": 31,
+    #     },
+    # ]
+
+    client = None
+    try:
+        client = MongoClient(mongo_uri)
+
+        db = client[db_name]
+        collection = db[collection_name]
+
+        for doc in documents:
+            filter_query = {"_id": doc["_id"]}
+            update_query = {
+                "$set": doc
+            }  # Use $set to update or insert the entire document
+            result = collection.update_one(filter_query, update_query, upsert=True)
+
+            log.info(f"Document with _id: {doc['_id']} upserted: {result.acknowledged}")
+    except Exception:
+        log.exception("Failed to insert into MongoDB")
+    finally:
+        if client:
+            client.close()
 
 
 # urls = glom(
