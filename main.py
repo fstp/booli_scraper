@@ -1,10 +1,13 @@
 import json
 import logging
+import re
+from datetime import datetime
 from string import Template
+from typing import Callable
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
-from glom import Assign, Coalesce, T, assign, delete, glom
+from glom import SKIP, Assign, Coalesce, T, assign, delete, glom
 from pymongo import MongoClient
 from rich import print_json
 from rich.logging import RichHandler
@@ -192,102 +195,10 @@ def get_detailed_info(id: int) -> str:
     return r.text
 
 
-stockholm_24_rooms = Template(
-    "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=3,4&page=$page&searchType=slutpriser"
-)
-
-collection = "sold_2020"
-start_date = "2020-01-01"
-end_date = "2020-12-31"
-page = 469
-
-r = requests.get(
-    # f"https://www.booli.se/sok/slutpriser?objectType=L%C3%A4genhet&rooms=3&page={page}",
-    stockholm_24_rooms.substitute(start_date=start_date, end_date=end_date, page=page),
-    headers=headers,
-)
-r.raise_for_status()
-# data = jslde.extract(r.text)
-# data = extruct.extract(r.text)
-
-log.info(f"extracted data")
-# pprint(data)
-
-soup = BeautifulSoup(r.text, "html.parser")
-script_tags = soup.find_all("script", type="application/json")
-
-if len(script_tags) == 1:
-    # json_data = json.loads(script_tags[0].text)
-    # print_json(json_data)
-    # pprint(script_tags[0].text)
-    json_data = json.loads(script_tags[0].text)
-    gloomed = glom(json_data, "props.pageProps.__APOLLO_STATE__")
-    filtered_data = {k: v for k, v in gloomed.items() if k.startswith("SoldProperty")}
-
-    with open("data.json", "w", encoding="utf-8") as file:
-        pretty_json = json.dumps(filtered_data, indent=4, ensure_ascii=False)
-        file.write(pretty_json)
-
-    documents = []
-
-    for k, v in filtered_data.items():
-        # delete(v, "__typename", ignore_missing=True)
-        # delete(v, "*.__typename", ignore_missing=True)
-        # assign(v, "id", int(v["id"]))
-        # assign(v, "_id", v["id"])
-        spec = {
-            "_id": ("id", T, int),
-            "id": ("id", T, int),
-            "amenities": "amenities",
-            "sold_price": "soldPrice.raw",
-            "street_address": "streetAddress",
-            "sold_sqm_price": "soldSqmPrice.formatted",
-            "sold_price_absolute_diff": Coalesce(
-                "soldPriceAbsoluteDiff.formatted", default=None
-            ),
-            "sold_price_percentage_diff": Coalesce(
-                "soldPricePercentageDiff.formatted", default=None
-            ),
-            "list_price": Coalesce("listPrice.formatted", default=None),
-            "living_area": "livingArea.formatted",
-            "rooms": "rooms.formatted",
-            "floor": Coalesce("floor.value", default=None),
-            "area_name": "descriptiveAreaName",
-            "days_active": "daysActive",
-            "sold_date": "soldDate",
-            "latitude": "latitude",
-            "longitude": "longitude",
-            "url": "url",
-        }
-        v = glom(v, spec)
-        detailed_info = json.loads(get_detailed_info(v["id"]))
-        agents = glom(detailed_info, ("data.object.salesOfResidence", ["agent"]))
-        v["agents"] = agents
-        documents.append(v)
-
-    pprint(documents)
-else:
-    log.error("No script tags found")
-
-# detailed_info = json.loads(get_detailed_info(3368476))
-# di_spec = {"agent": ("data.object.salesOfResidence", ["agent"])}
-
-
 def save_to_mongo(documents, collection):
     mongo_uri = "mongodb://root:root@localhost:27017/"
     db_name = "booli"
     collection_name = "sold_2020"
-
-    # documents = [
-    #     {"_id": 1, "name": "Alice", "age": 30},
-    #     {"_id": 2, "name": "Bob", "age": 25},
-    #     {"_id": 3, "name": "Charlie", "age": 35},
-    #     {
-    #         "_id": 1,
-    #         "name": "Updated Alice",
-    #         "age": 31,
-    #     },
-    # ]
 
     client = None
     try:
@@ -310,6 +221,127 @@ def save_to_mongo(documents, collection):
         if client:
             client.close()
 
+
+stockholm_34_rooms = Template(
+    "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=3,4&page=$page&searchType=slutpriser"
+)
+
+collection = "sold_2020"
+start_date = "2020-01-01"
+end_date = "2020-12-31"
+page = 469
+
+log.info(f"Scraping page {page} in range [{start_date}, {end_date}]")
+
+r = requests.get(
+    # f"https://www.booli.se/sok/slutpriser?objectType=L%C3%A4genhet&rooms=3&page={page}",
+    stockholm_34_rooms.substitute(start_date=start_date, end_date=end_date, page=page),
+    headers=headers,
+)
+r.raise_for_status()
+
+soup = BeautifulSoup(r.text, "html.parser")
+script_tags = soup.find_all("script", type="application/json")
+
+if len(script_tags) == 1:
+    # json_data = json.loads(script_tags[0].text)
+    # print_json(json_data)
+    # pprint(script_tags[0].text)
+    json_data = json.loads(script_tags[0].text)
+    gloomed = glom(json_data, "props.pageProps.__APOLLO_STATE__")
+    filtered_data = {k: v for k, v in gloomed.items() if k.startswith("SoldProperty")}
+
+    with open("data.json", "w", encoding="utf-8") as file:
+        pretty_json = json.dumps(filtered_data, indent=4, ensure_ascii=False)
+        file.write(pretty_json)
+
+    documents = []
+
+    for k, v in filtered_data.items():
+        spec = {
+            "_id": ("id", T, int),
+            "id": ("id", T, int),
+            "amenities": "amenities",
+            "sold_price": "soldPrice.raw",
+            "street_address": "streetAddress",
+            "sold_sqm_price": "soldSqmPrice.formatted",
+            "sold_price_absolute_diff": Coalesce(
+                "soldPriceAbsoluteDiff.formatted", default=None
+            ),
+            "sold_price_percentage_diff": Coalesce(
+                "soldPricePercentageDiff.formatted", default=None
+            ),
+            "list_price": Coalesce("listPrice.formatted", default=None),
+            "living_area": "livingArea.formatted",
+            "rooms": "rooms.formatted",
+            "floor": Coalesce(("floor.value", T, int), default=None),
+            "area_name": "descriptiveAreaName",
+            "days_active": "daysActive",
+            "sold_date": "soldDate",
+            "latitude": "latitude",
+            "longitude": "longitude",
+            "url": "url",
+        }
+        v = glom(v, spec)
+
+        if v["sold_sqm_price"] is not None:
+            cleaned = v["sold_sqm_price"].replace("\xa0", "")
+            cleaned = re.findall(r"\d+", cleaned)[0]
+            v["sold_sqm_price"] = int(cleaned)
+
+        if v["sold_price_absolute_diff"] is not None:
+            cleaned = v["sold_price_absolute_diff"].replace(" ", "")
+            cleaned = re.findall(r"[+-]?\d+", cleaned)[0]
+            v["sold_price_absolute_diff"] = int(cleaned)
+
+        if v["sold_price_percentage_diff"] is not None:
+            cleaned = v["sold_price_percentage_diff"].replace(",", ".").replace("%", "")
+            cleaned = cleaned.replace("+/-", "")
+            v["sold_price_percentage_diff"] = float(cleaned)
+
+        if v["list_price"] is not None:
+            cleaned = v["list_price"].replace("\xa0", "")
+            cleaned = re.findall(r"\d+", cleaned)[0]
+            v["list_price"] = int(cleaned)
+
+        if v["living_area"] is not None:
+            cleaned = v["living_area"].replace("\xa0", "")
+            cleaned = re.findall(r"\d+", cleaned)[0]
+            v["living_area"] = int(cleaned)
+
+        if v["rooms"] is not None:
+            cleaned = re.findall(r"\d+", v["rooms"])[0]
+            v["rooms"] = int(cleaned)
+
+        if v["sold_date"] is not None:
+            cleaned = datetime.strptime(v["sold_date"], "%Y-%m-%d").date()
+            v["sold_date"] = cleaned
+
+        detailed_info = json.loads(get_detailed_info(v["id"]))
+        detailed_info = glom(
+            detailed_info,
+            {
+                "agent": ("data.object.salesOfResidence", ["agent"]),
+                "agency": ("data.object.salesOfResidence", ["agency"]),
+            },
+        )
+        detailed_info["agent"] = [x for x in detailed_info["agent"] if x is not None]
+        detailed_info["agency"] = [x for x in detailed_info["agency"] if x is not None]
+
+        for a in detailed_info["agent"]:
+            a["id"] = int(a["id"])
+
+        for a in detailed_info["agency"]:
+            a["id"] = int(a["id"])
+
+        v.update(detailed_info)
+        documents.append(v)
+
+    pprint(documents)
+else:
+    log.error("no script tags found")
+
+log.info("Saving to MongoDB")
 
 # urls = glom(
 #     data,
