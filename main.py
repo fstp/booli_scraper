@@ -1,17 +1,19 @@
+import itertools
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from string import Template
-from typing import Callable
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
-from glom import SKIP, Assign, Coalesce, T, assign, delete, glom
+from glom import Coalesce, T, glom
 from pymongo import MongoClient
-from rich import print_json
 from rich.logging import RichHandler
-from rich.pretty import pprint
+
+# from rich import print_json
+# from rich.pretty import pprint
 
 FORMAT = "%(message)s"
 logging.basicConfig(
@@ -34,7 +36,6 @@ headers = {
     "Referer": "https://www.booli.se/sok/slutpriser",
     "content-type": "application/json",
     "api-client": "booli.se",
-    # "Content-Length": "5457",  # Note: This should be a string
     "Origin": "https://www.booli.se",
     "DNT": "1",
     "Sec-GPC": "1",
@@ -192,6 +193,7 @@ def get_detailed_info(id: int) -> str:
         headers=headers,
         json=graphql_payload,
     )
+    r.raise_for_status()
     return r.text
 
 
@@ -222,49 +224,51 @@ def save_to_mongo(documents, collection):
             client.close()
 
 
-stockholm_34_rooms = Template(
-    "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=3,4&page=$page&searchType=slutpriser"
-)
+def json_serial(obj):
+    """JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
 
-collection = "sold_2020"
-start_date = "2020-01-01"
-end_date = "2020-12-31"
-page = 469
 
-log.info(f"Scraping page {page} in range [{start_date}, {end_date}]")
+def scraping_page(
+    page: int, collection: str, template: Template, start_date: str, end_date: str
+):
+    log.info(f"Scraping page {page} in range [{start_date}, {end_date}]")
+    log.info(f"Saving into collection: {collection}")
 
-r = requests.get(
-    # f"https://www.booli.se/sok/slutpriser?objectType=L%C3%A4genhet&rooms=3&page={page}",
-    stockholm_34_rooms.substitute(start_date=start_date, end_date=end_date, page=page),
-    headers=headers,
-)
-r.raise_for_status()
+    script_tags = []
+    for _ in range(5):
+        r = requests.get(
+            template.substitute(start_date=start_date, end_date=end_date, page=page),
+            headers=headers,
+        )
+        r.raise_for_status()
 
-soup = BeautifulSoup(r.text, "html.parser")
-script_tags = soup.find_all("script", type="application/json")
+        soup = BeautifulSoup(r.text, "html.parser")
+        script_tags = soup.find_all("script", type="application/json")
+        if script_tags:
+            break
+        log.error(f"Retrying page {page}...")
+        time.sleep(5)
 
-if len(script_tags) == 1:
-    # json_data = json.loads(script_tags[0].text)
-    # print_json(json_data)
-    # pprint(script_tags[0].text)
     json_data = json.loads(script_tags[0].text)
     gloomed = glom(json_data, "props.pageProps.__APOLLO_STATE__")
     filtered_data = {k: v for k, v in gloomed.items() if k.startswith("SoldProperty")}
 
-    with open("data.json", "w", encoding="utf-8") as file:
-        pretty_json = json.dumps(filtered_data, indent=4, ensure_ascii=False)
-        file.write(pretty_json)
+    with open("not_processed.json", "w", encoding="utf-8") as file:
+        json.dump(filtered_data, file, indent=4, ensure_ascii=False)
 
     documents = []
 
-    for k, v in filtered_data.items():
+    for _, v in filtered_data.items():
         spec = {
             "_id": ("id", T, int),
             "id": ("id", T, int),
             "amenities": "amenities",
             "sold_price": "soldPrice.raw",
             "street_address": "streetAddress",
-            "sold_sqm_price": "soldSqmPrice.formatted",
+            "sold_sqm_price": Coalesce("soldSqmPrice.formatted", default=None),
             "sold_price_absolute_diff": Coalesce(
                 "soldPriceAbsoluteDiff.formatted", default=None
             ),
@@ -272,12 +276,12 @@ if len(script_tags) == 1:
                 "soldPricePercentageDiff.formatted", default=None
             ),
             "list_price": Coalesce("listPrice.formatted", default=None),
-            "living_area": "livingArea.formatted",
-            "rooms": "rooms.formatted",
-            "floor": Coalesce(("floor.value", T, int), default=None),
+            "living_area": Coalesce("livingArea.formatted", default=None),
+            "rooms": Coalesce("rooms.formatted", default=None),
+            "floor": Coalesce("floor.value", default=None),
             "area_name": "descriptiveAreaName",
             "days_active": "daysActive",
-            "sold_date": "soldDate",
+            "sold_date": Coalesce("soldDate", default=None),
             "latitude": "latitude",
             "longitude": "longitude",
             "url": "url",
@@ -313,35 +317,69 @@ if len(script_tags) == 1:
             cleaned = re.findall(r"\d+", v["rooms"])[0]
             v["rooms"] = int(cleaned)
 
+        if v["floor"] is not None:
+            cleaned = v["floor"].replace(",", ".")
+            cleaned = 0.0 if cleaned == "BV" else float(cleaned)
+            v["floor"] = cleaned
+
         if v["sold_date"] is not None:
-            cleaned = datetime.strptime(v["sold_date"], "%Y-%m-%d").date()
+            cleaned = datetime.strptime(v["sold_date"], "%Y-%m-%d")
             v["sold_date"] = cleaned
 
-        detailed_info = json.loads(get_detailed_info(v["id"]))
-        detailed_info = glom(
-            detailed_info,
-            {
-                "agent": ("data.object.salesOfResidence", ["agent"]),
-                "agency": ("data.object.salesOfResidence", ["agency"]),
-            },
-        )
-        detailed_info["agent"] = [x for x in detailed_info["agent"] if x is not None]
-        detailed_info["agency"] = [x for x in detailed_info["agency"] if x is not None]
+        # try:
+        #     detailed_info = json.loads(get_detailed_info(v["id"]))
 
-        for a in detailed_info["agent"]:
-            a["id"] = int(a["id"])
+        #     with open("detailed.json", "w", encoding="utf-8") as file:
+        #         json.dump(detailed_info, file, indent=4, ensure_ascii=False)
 
-        for a in detailed_info["agency"]:
-            a["id"] = int(a["id"])
+        #     detailed_info = glom(
+        #         detailed_info,
+        #         {
+        #             "agent": Coalesce(
+        #                 ("data.object.salesOfResidence", ["agent"]), default=[]
+        #             ),
+        #             "agency": Coalesce(
+        #                 ("data.object.salesOfResidence", ["agency"]), default=[]
+        #             ),
+        #         },
+        #     )
+        #     detailed_info["agent"] = [
+        #         x for x in detailed_info["agent"] if x is not None
+        #     ]
+        #     detailed_info["agency"] = [
+        #         x for x in detailed_info["agency"] if x is not None
+        #     ]
+        #     for a in detailed_info["agent"]:
+        #         a["id"] = int(a["id"])
+        #     for a in detailed_info["agency"]:
+        #         a["id"] = int(a["id"])
+        #     v.update(detailed_info)
+        # except JSONDecodeError:
+        #     log.exception(f"Failed to get detailed info for {v['id']} on page {page}")
 
-        v.update(detailed_info)
         documents.append(v)
 
-    pprint(documents)
-else:
-    log.error("no script tags found")
+    with open("processed.json", "w", encoding="utf-8") as file:
+        json.dump(documents, file, indent=4, ensure_ascii=False, default=json_serial)
 
-log.info("Saving to MongoDB")
+    log.info("Saving to MongoDB")
+    save_to_mongo(documents, collection)
+
+
+stockholm_34_rooms = Template(
+    "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=3,4&page=$page&searchType=slutpriser"
+)
+
+collection = "sold"
+start_date = "2020-01-01"
+end_date = "2020-12-31"
+
+try:
+    for i in itertools.count(300):
+        scraping_page(i, collection, stockholm_34_rooms, start_date, end_date)
+        time.sleep(5)
+except Exception:
+    log.exception("Finished scraping")
 
 # urls = glom(
 #     data,

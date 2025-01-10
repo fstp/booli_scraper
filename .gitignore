@@ -1,4 +1,6 @@
 mongodb/
 venv/
 .project
-data.json
+detailed.json
+not_processed.json
+processed.json
