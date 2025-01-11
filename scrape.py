@@ -86,14 +86,13 @@ def get_detailed_info(id: int) -> str:
 def save_to_mongo(documents, collection):
     mongo_uri = "mongodb://root:root@localhost:27017/"
     db_name = "booli"
-    collection_name = "sold_2020"
 
     client = None
     try:
         client = MongoClient(mongo_uri)
 
         db = client[db_name]
-        collection = db[collection_name]
+        collection = db[collection]
 
         for doc in documents:
             filter_query = {"_id": doc["_id"]}
@@ -221,17 +220,48 @@ def scraping_page(
     save_to_mongo(documents, collection)
 
 
-stockholm_34_rooms = Template(
-    "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=3,4&page=$page&searchType=slutpriser"
-)
+def run_scrape():
+    stockholm_34_rooms = Template(
+        "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=3,4&page=$page&searchType=slutpriser"
+    )
+    stockholm_12_rooms = Template(
+        "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=1,2&page=$page&searchType=slutpriser"
+    )
 
-collection = "sold"
-start_date = "2020-01-01"
-end_date = "2020-12-31"
+    years = [
+        "2015",
+        "2016",
+        "2017",
+        "2018",
+        "2019",
+        "2020",
+        "2021",
+        "2022",
+        "2023",
+        "2024",
+    ]
 
-try:
-    for i in itertools.count(300):
-        scraping_page(i, collection, stockholm_34_rooms, start_date, end_date)
-        time.sleep(5)
-except Exception:
-    log.exception("Finished scraping")
+    collection = "sold"
+
+    for year in years:
+        start_date = f"{year}-01-01"
+        end_date = f"{year}-12-31"
+
+        i = 1
+        try:
+            for i in itertools.count(1):
+                scraping_page(i, collection, stockholm_12_rooms, start_date, end_date)
+                time.sleep(5)
+        except Exception as e:
+            log.exception("Finished scraping")
+            with open("error_log.txt", "a") as f:
+                f.write(
+                    f"An error occurred during scraping {year} on page {i}: {str(e)}\n\n"
+                )
+
+        # Save the last update time as metadata
+        save_to_mongo([{"_id": "meta", "last_update": datetime.now()}], "sold")
+
+
+if __name__ == "__main__":
+    run_scrape()

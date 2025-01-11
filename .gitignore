@@ -4,3 +4,4 @@ venv/
 detailed.json
 not_processed.json
 processed.json
+error_log.txt
