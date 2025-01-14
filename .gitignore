@@ -5,3 +5,5 @@ detailed.json
 not_processed.json
 processed.json
 error_log.txt
+__pycache__/
+tmp*/
