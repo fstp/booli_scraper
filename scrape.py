@@ -8,9 +8,11 @@ from string import Template
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
-from glom import Coalesce, T, glom
+from glom import SKIP, Coalesce, T, glom
 from pymongo import MongoClient
+from rich import print_json
 from rich.logging import RichHandler
+from rich.pretty import pprint
 
 FORMAT = "%(message)s"
 logging.basicConfig(
@@ -45,34 +47,47 @@ headers = {
 }
 
 
-def get_detailed_info(id: int) -> str:
+def to_datetime(date_str: str):
+    return datetime.strptime(date_str, "%Y-%m-%d")
+
+
+def graphql_sales_data(url_id: int) -> str:
     graphql_payload = {
-        "operationName": "selectedListing",
-        "variables": {"id": id},
-        "query": """query selectedListing($id: ID!) {
-          object: propertyByListingId(listingId: $id) {
-            __typename
-            ... on Property {
+        "operationName": "salesOfProperty",
+        "variables": {"residenceId": url_id, "booliId": url_id},
+        "query": """query salesOfProperty($residenceId: ID, $booliId: ID) {
+          salesOfProperty(residenceId: $residenceId, booliId: $booliId) {
+            id
+            url
+            agent {
               id
-              salesOfResidence {
-                id
-                booliId
-                agency {
-                  id
-                  name
-                  url
-                  thumbnail
+              recommendations
+              email
+              name
+              overallRating
+              reviewCount
+              url
+              premium
+              image
+              listingStatistics {
+                startDate
+                endDate
+                publishedCount
+                publishedValue {
+                  raw
                 }
-                agent {
-                  id
-                  name
-                  image
-                  premium
-                }
+                recommendedCount
               }
             }
+            agency {
+              id
+              name
+              url
+              thumbnail
+            }
           }
-        }""",
+        }
+        """,
     }
     r = requests.post(
         "https://www.booli.se/graphql",
@@ -149,68 +164,80 @@ def scraping_page(
     for _, v in filtered_data.items():
         spec = {
             "_id": ("id", T, int),
-            "id": ("id", T, int),
             "amenities": "amenities",
             "sold_price": "soldPrice.raw",
             "street_address": "streetAddress",
-            "sold_sqm_price": Coalesce("soldSqmPrice.formatted", default=None),
+            "sold_sqm_price": Coalesce("soldSqmPrice.formatted", default=SKIP),
             "sold_price_absolute_diff": Coalesce(
-                "soldPriceAbsoluteDiff.formatted", default=None
+                "soldPriceAbsoluteDiff.formatted", default=SKIP
             ),
             "sold_price_percentage_diff": Coalesce(
-                "soldPricePercentageDiff.formatted", default=None
+                "soldPricePercentageDiff.formatted", default=SKIP
             ),
-            "list_price": Coalesce("listPrice.formatted", default=None),
-            "living_area": Coalesce("livingArea.formatted", default=None),
-            "rooms": Coalesce("rooms.formatted", default=None),
-            "floor": Coalesce("floor.value", default=None),
+            "list_price": Coalesce("listPrice.formatted", default=SKIP),
+            "living_area": Coalesce("livingArea.formatted", default=SKIP),
+            "rooms": Coalesce("rooms.formatted", default=SKIP),
+            "floor": Coalesce("floor.value", default=SKIP),
             "area_name": "descriptiveAreaName",
             "days_active": "daysActive",
-            "sold_date": Coalesce("soldDate", default=None),
+            "sold_date": Coalesce(("soldDate", T, to_datetime), default=SKIP),
             "latitude": "latitude",
             "longitude": "longitude",
             "url": "url",
         }
         v = glom(v, spec)
 
-        if v["sold_sqm_price"] is not None:
+        if "sold_sqm_price" in v:
             cleaned = v["sold_sqm_price"].replace("\xa0", "")
             cleaned = re.findall(r"\d+", cleaned)[0]
             v["sold_sqm_price"] = int(cleaned)
 
-        if v["sold_price_absolute_diff"] is not None:
+        if "sold_price_absolute_diff" in v:
             cleaned = v["sold_price_absolute_diff"].replace(" ", "")
             cleaned = re.findall(r"[+-]?\d+", cleaned)[0]
             v["sold_price_absolute_diff"] = int(cleaned)
 
-        if v["sold_price_percentage_diff"] is not None:
+        if "sold_price_percentage_diff" in v:
             cleaned = v["sold_price_percentage_diff"].replace(",", ".").replace("%", "")
             cleaned = cleaned.replace("+/-", "")
             v["sold_price_percentage_diff"] = float(cleaned)
 
-        if v["list_price"] is not None:
+        if "list_price" in v:
             cleaned = v["list_price"].replace("\xa0", "")
             cleaned = re.findall(r"\d+", cleaned)[0]
             v["list_price"] = int(cleaned)
 
-        if v["living_area"] is not None:
+        if "living_area" in v:
             cleaned = v["living_area"].replace("\xa0", "")
             cleaned = re.findall(r"\d+", cleaned)[0]
             v["living_area"] = int(cleaned)
 
-        if v["rooms"] is not None:
+        if "rooms" in v:
             cleaned = re.findall(r"\d+", v["rooms"])[0]
             v["rooms"] = int(cleaned)
 
-        if v["floor"] is not None:
+        if "floor" in v:
             cleaned = v["floor"].replace(",", ".")
             cleaned = 0.0 if cleaned == "BV" else float(cleaned)
             v["floor"] = cleaned
 
-        if v["sold_date"] is not None:
-            cleaned = datetime.strptime(v["sold_date"], "%Y-%m-%d")
-            v["sold_date"] = cleaned
+        # if "sold_date" in v:
+        #     cleaned = datetime.strptime(v["sold_date"], "%Y-%m-%d")
+        #     v["sold_date"] = cleaned
 
+        v["url_id"] = int(re.findall(r"\d+", v["url"])[0])
+
+        while True:
+            try:
+                v["sales"] = get_sales_data(v["url_id"])["sales"]
+                time.sleep(2)
+            except Exception:
+                log.exception(f"Failed to get sales data for id: {v['_id']}")
+                time.sleep(180)
+                continue
+            break
+
+        log.info(f"Scraped data for id: {v['_id']}")
         documents.append(v)
 
     with open("processed.json", "w", encoding="utf-8") as file:
@@ -229,6 +256,12 @@ def run_scrape():
     )
 
     years = [
+        "2009",
+        "2010",
+        "2011",
+        "2012",
+        "2013",
+        "2014",
         "2015",
         "2016",
         "2017",
@@ -238,7 +271,8 @@ def run_scrape():
         "2021",
         "2022",
         "2023",
-        "2024",
+        # "2024",
+        # "2025",
     ]
 
     collection = "sold"
@@ -263,5 +297,66 @@ def run_scrape():
         save_to_mongo([{"_id": "meta", "last_update": datetime.now()}], "sold")
 
 
+def get_sales_data(url_id: int):
+    data = json.loads(graphql_sales_data(url_id))
+    spec = {
+        "sales": Coalesce(
+            (
+                "data.salesOfProperty",
+                [
+                    {
+                        "id": ("id", T, int),
+                        "url": "url",
+                        "agent": Coalesce(
+                            (
+                                "agent",
+                                {
+                                    "id": ("id", T, int),
+                                    "recommendations": "recommendations",
+                                    "email": "email",
+                                    "name": "name",
+                                    "overall_rating": "overallRating",
+                                    "review_count": "reviewCount",
+                                    "url": "url",
+                                    "image": Coalesce("image", default=SKIP),
+                                    "premium": Coalesce("premium", default=SKIP),
+                                    "listing_statistics": (
+                                        "listingStatistics",
+                                        {
+                                            "start_date": ("startDate", T, to_datetime),
+                                            "end_date": ("endDate", T, to_datetime),
+                                            "published_count": "publishedCount",
+                                            "published_value": "publishedValue.raw",
+                                            "recommended_count": "recommendedCount",
+                                        },
+                                    ),
+                                },
+                            ),
+                            default=None,
+                        ),
+                        "agency": Coalesce(
+                            (
+                                "agency",
+                                {
+                                    "id": ("id", T, int),
+                                    "name": "name",
+                                    "url": Coalesce("url", default=SKIP),
+                                    "thumbnail": Coalesce("thumbnail", default=SKIP),
+                                },
+                            ),
+                            default=None,
+                        ),
+                    }
+                ],
+            ),
+            default=[],
+        ),
+    }
+    v = glom(data, spec)
+    return v
+
+
 if __name__ == "__main__":
     run_scrape()
+    # json_data = get_sales_data(595043)
+    # pprint(json_data)
