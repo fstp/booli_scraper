@@ -234,8 +234,8 @@ def scraping_page(
             except Exception:
                 log.exception(f"Failed to get sales data for id: {v['_id']}")
                 time.sleep(180)
-                continue
-            break
+            else:
+                break
 
         log.info(f"Scraped data for id: {v['_id']}")
         documents.append(v)
@@ -256,11 +256,11 @@ def run_scrape():
     )
 
     years = [
-        "2009",
-        "2010",
-        "2011",
-        "2012",
-        "2013",
+        # "2009",
+        # "2010",
+        # "2011",
+        # "2012",
+        # "2013",
         "2014",
         "2015",
         "2016",
