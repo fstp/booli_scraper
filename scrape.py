@@ -8,6 +8,7 @@ from string import Template
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
+from curl_cffi.requests.exceptions import HTTPError
 from glom import SKIP, Coalesce, T, glom
 from pymongo import MongoClient
 from rich import print_json
@@ -256,42 +257,64 @@ def run_scrape():
     )
 
     years = [
-        # "2009",
-        # "2010",
-        # "2011",
-        # "2012",
-        # "2013",
-        "2014",
-        "2015",
-        "2016",
-        "2017",
-        "2018",
-        "2019",
-        "2020",
-        "2021",
-        "2022",
-        "2023",
-        # "2024",
-        # "2025",
+        # ("2009", 1),
+        # ("2010", 1),
+        # ("2011", 1),
+        # ("2012", 1),
+        # ("2013", 1),
+        # ("2014", 198),
+        # ("2015", 230),
+        # ("2016", 1),
+        # ("2017", 326),
+        ("2018", 25),
+        ("2019", 1),
+        ("2020", 1),
+        ("2021", 1),
+        ("2022", 1),
+        ("2023", 1),
+        # ("2024", 1),
+        # ("2025", 1),
     ]
 
     collection = "sold"
 
-    for year in years:
+    for year, page in years:
         start_date = f"{year}-01-01"
         end_date = f"{year}-12-31"
 
-        i = 1
-        try:
-            for i in itertools.count(1):
-                scraping_page(i, collection, stockholm_12_rooms, start_date, end_date)
-                time.sleep(5)
-        except Exception as e:
-            log.exception("Finished scraping")
-            with open("error_log.txt", "a") as f:
-                f.write(
-                    f"An error occurred during scraping {year} on page {i}: {str(e)}\n\n"
-                )
+        i = 0
+        while True:
+            try:
+                log.info(f"Scraping year {year} on page {page}")
+                for i in itertools.count(page):
+                    scraping_page(
+                        i, collection, stockholm_34_rooms, start_date, end_date
+                    )
+                    time.sleep(5)
+            except HTTPError as e:
+                pattern = r"HTTP Error (\d+):"
+                match = re.search(pattern, str(e))
+                if match and match.group(1) == "404":
+                    log.exception("Finished scraping")
+                    with open("error_log.txt", "a") as f:
+                        f.write(f"Finished scraping {year} on page {i}:\n{str(e)}\n\n")
+                    break
+                else:
+                    log.exception("A HTTP error occurred, retrying after 180 seconds")
+                    with open("error_log.txt", "a") as f:
+                        f.write(
+                            f"A HTTP error occurred during scraping {year} on page {i}:\n{str(e)}\n\n"
+                        )
+                    time.sleep(180)
+                    page = i
+            except Exception as e:
+                log.exception("An unknown error occurred, retrying after 180 seconds")
+                with open("error_log.txt", "a") as f:
+                    f.write(
+                        f"An unknown error occurred during scraping {year} on page {i}:\n{str(e)}\n\n"
+                    )
+                time.sleep(180)
+                page = i
 
         # Save the last update time as metadata
         save_to_mongo([{"_id": "meta", "last_update": datetime.now()}], "sold")
