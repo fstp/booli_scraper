@@ -7,3 +7,6 @@ processed.json
 error_log.txt
 __pycache__/
 tmp*/
+docker/data/
+.ipynb_checkpoints/
+requirements.txt
