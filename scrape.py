@@ -99,6 +99,21 @@ def graphql_sales_data(url_id: int) -> str:
     return r.text
 
 
+def load_meta():
+    mongo_uri = "mongodb://root:root@localhost:27017/"
+    db_name = "booli"
+    client = None
+    try:
+        client = MongoClient(mongo_uri)
+        db = client[db_name]
+        collection = db["sold"]
+        result = collection.find_one({"_id": "meta"})
+        return result
+    finally:
+        if client:
+            client.close()
+
+
 def save_to_mongo(documents, collection):
     mongo_uri = "mongodb://root:root@localhost:27017/"
     db_name = "booli"
@@ -248,6 +263,68 @@ def scraping_page(
     save_to_mongo(documents, collection)
 
 
+def run_catch_up_scrape():
+    stockholm_34_rooms = Template(
+        "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=3,4&page=$page&searchType=slutpriser"
+    )
+    stockholm_12_rooms = Template(
+        "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=1,2&page=$page&searchType=slutpriser"
+    )
+
+    templates = [
+        ("Sthlm 1&2 rooms", stockholm_12_rooms),
+        ("Sthlm 3&4 rooms", stockholm_34_rooms),
+    ]
+
+    meta = load_meta()
+    if not meta:
+        log.error("Failed to load metadata")
+        return
+
+    start_date = meta["last_update"].strftime("%Y-%m-%d")
+    end_date = datetime.now().strftime("%Y-%m-%d")
+
+    collection = "sold"
+
+    for name, template in templates:
+        log.info(f"Scraping: {name}")
+        page = 1
+        i = 0
+        while True:
+            try:
+                log.info(f"Scraping from {start_date} to {end_date} on page {i}")
+                for i in itertools.count(page):
+                    scraping_page(i, collection, template, start_date, end_date)
+                    time.sleep(5)
+            except HTTPError as e:
+                pattern = r"HTTP Error (\d+):"
+                match = re.search(pattern, str(e))
+                if match and match.group(1) == "404":
+                    log.exception(f"Finished scraping {name}")
+                    with open("error_log.txt", "a") as f:
+                        f.write(f"Finished scraping {name} on page {i}:\n{str(e)}\n\n")
+                    break
+                else:
+                    log.exception("A HTTP error occurred, retrying after 180 seconds")
+                    with open("error_log.txt", "a") as f:
+                        f.write(
+                            f"A HTTP error occurred during scraping on page {i}:\n{str(e)}\n\n"
+                        )
+                    time.sleep(180)
+                    page = i
+            except Exception as e:
+                log.exception("An unknown error occurred, retrying after 180 seconds")
+                with open("error_log.txt", "a") as f:
+                    f.write(
+                        f"An unknown error occurred during scraping  on page {i}:\n{str(e)}\n\n"
+                    )
+                time.sleep(180)
+                page = i
+
+    # Save the last update time as metadata
+    save_to_mongo([{"_id": "meta", "last_update": datetime.now()}], "sold")
+
+
 def run_scrape():
     stockholm_34_rooms = Template(
         "https://www.booli.se/sok/slutpriser?areaIds=2&maxSoldDate=$end_date&minSoldDate=$start_date&objectType=L%C3%A4genhet&rooms=3,4&page=$page&searchType=slutpriser"
@@ -380,6 +457,7 @@ def get_sales_data(url_id: int):
 
 
 if __name__ == "__main__":
-    run_scrape()
+    run_catch_up_scrape()
+    # run_scrape()
     # json_data = get_sales_data(595043)
     # pprint(json_data)
