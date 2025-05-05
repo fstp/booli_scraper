@@ -10,3 +10,7 @@ The scraper relies on Booli's internal API, which is unofficial and may change o
 ## Disclaimer
 
 This project is intended for educational purposes only. Use at your own risk, and ensure compliance with Booli's terms of service and applicable laws.
+
+## Data
+
+There is a snapshot of MongoDB containing scraped data in Google Drive.
