@@ -1,0 +1,366 @@
+#!/usr/bin/env -S uv run --script
+# vim: ft=python
+# coding: utf-8
+# /// script
+# dependencies = [
+#   "httpx",
+#   "rich",
+#   "glom",
+#   "pymongo",
+# ]
+# ///
+import httpx
+import re
+import time
+import json
+from datetime import datetime
+from rich.console import Console
+from rich.traceback import install
+from glom import glom, GlomError, SKIP, Coalesce, T, Delete
+from pymongo import MongoClient
+
+# Initialize the Rich console and install pretty print exception handler
+console = Console()
+install(show_locals=True)
+
+# --- GraphQL Query Setup ---
+base_url = "https://www.booli.se/graphql"
+headers = {"Content-Type": "application/json; charset=utf-8"}
+
+
+def graphql_listings(client: httpx.Client, start_date: str, end_date: str, page: int):
+    """
+    Query the Booli GraphQL endpoint for listings.
+    """
+    variables = {
+        "queryContext": "SERP_LIST_LISTING",
+        "input": {
+            "filters": [
+                {"key": "maxSoldDate", "value": end_date},
+                {"key": "minSoldDate", "value": start_date},
+                {"key": "objectType", "value": "Lägenhet"},
+            ],
+            "areaId": "2",
+            "sort": "",
+            "page": page,
+            "ascending": False,
+            "excludeAncestors": True,
+            "facets": ["upcomingSale"],
+        },
+    }
+    extensions = {
+        "persistedQuery": {
+            "version": 1,
+            "sha256Hash": "e6afcbda5c671553ce4ac70334362174c136b21eb3cfc1b20104be0b4ea9646c",
+        }
+    }
+    params = {
+        "operationName": "search",
+        "variables": json.dumps(variables),
+        "extensions": json.dumps(extensions),
+    }
+    response = client.get(base_url, headers=headers, params=params)
+    response.raise_for_status()
+    return response.json()
+
+
+def graphql_sales_of_property(client: httpx.Client, id: int):
+    """
+    Query the Booli GraphQL endpoint for sales of a specific property by id.
+    """
+    variables = {"booliId": str(id)}
+    extensions = {
+        "persistedQuery": {
+            "version": 1,
+            "sha256Hash": "c800c7a200930d88da9d9115912685c708261ee4ed7273f3753e0d2fc818f683",
+        }
+    }
+    params = {
+        "operationName": "salesOfProperty",
+        "variables": json.dumps(variables),
+        "extensions": json.dumps(extensions),
+    }
+    response = client.get(base_url, headers=headers, params=params)
+    response.raise_for_status()
+
+    if response.status_code == 202:
+        console.print(
+            f"⏰ HTTP 202 Accepted received for sales query on [cyan]{id}[/cyan], back off and try again",
+            style="yellow",
+        )
+        max_attempts = 10
+
+        for attempt in range(max_attempts):
+            time.sleep(120)
+            console.print(
+                f"📨 Retrying sales query attempt {attempt+1} on [cyan]{id}[/cyan]...",
+                style="blue",
+            )
+            response = client.get(base_url, headers=headers, params=params)
+            response.raise_for_status()
+            if response.status_code != 202:
+                console.print(
+                    f"✓ Successful sales query for [cyan]{id}[/cyan].", style="green"
+                )
+                return response.json()
+
+        # TODO: Maybe add retry logic here, let's just return an empty array for now.
+        console.print(f"❌ Failed sales query on [cyan]{id}[/cyan].", style="bold red")
+        return {"data": {"salesOfProperty": []}}
+
+    return response.json()
+
+
+def try_extract_data(point):
+    zero_float = lambda _: 0.0
+    def sum_numbers(match_text):
+        # Handle "number+number" format, convert to integers and sum
+        console.print(f"Summing numbers in '{match_text}'", style="blue")
+        if '+' in match_text:
+            numbers = match_text.split('+')
+            return float(sum(float(num) for num in numbers))
+        return float(match_text)
+
+    regex_patterns = [
+        (re.compile(r"^(\d+(\.\d*)?)m²"), float, "living_area"),
+        (re.compile(r"^(\d+\.?\d*(?:\+\d+\.?\d*))"), sum_numbers, "living_area"),
+        (re.compile(r"^(\d+(\.\d*)?)rum"), float, "rooms"),
+        (re.compile(r"^(BV)"), zero_float, "floor"),
+        (re.compile(r"^vån([+-]?\d+(\.\d*)?)"), float, "floor"),
+        (re.compile(r"^(\d+(\.\d*)?)kr/m²"), float, "sold_sqm_price"),
+    ]
+
+    for pattern, cast_fn, key in regex_patterns:
+        match = pattern.match(point)
+        if match:
+            return {key: cast_fn(match.group(1))}
+
+    console.print(f"No pattern matched for point {point}", style="bold red")
+    return dict()
+
+
+def extract_data_points(data):
+    points = glom(data, ("displayAttributes.dataPoints", ["value.plainText"]))
+    points = [p.replace("\xa0", " ").replace(" ", "").replace(",", ".") for p in points]
+    console.print(points)
+
+    result = dict()
+    for p in points:
+        result = result | try_extract_data(p)
+
+    if len(result) == 0:
+        console.print(f"[bold red]❗Failed to extract any data points[/bold red]")
+
+    console.print(result)
+    return result
+
+
+def extract_digits(keys, data, type_fn):
+    for key in keys:
+        if key in data:
+            tmp = data[key]
+            tmp = (
+                tmp.replace("\xa0", "")
+                .replace(" ", "")
+                .replace(",", ".")
+                .replace("\u00b1", "+")
+            )
+            tmp = type_fn(re.match(r"^([+-]?\d+(\.\d*)?)", tmp).group(1))  # type: ignore
+            data[key] = tmp
+    return data
+
+
+def clean_data(data):
+    to_datetime = lambda s: datetime.strptime(s, "%Y-%m-%d")
+    data_points = extract_data_points(data)
+    spec = {
+        "_id": ("id", T, int),
+        "amenities": "amenities",
+        "sold_price": "soldPrice.raw",
+        "street_address": "streetAddress",
+        "sold_price_absolute_diff": Coalesce(
+            "soldPriceAbsoluteDiff.formatted", default=SKIP
+        ),
+        "sold_price_percentage_diff": Coalesce(
+            "soldPricePercentageDiff.raw", default=SKIP
+        ),
+        "list_price": Coalesce("listPrice.formatted", default=SKIP),
+        "area_name": "descriptiveAreaName",
+        "days_active": Coalesce("daysActive", default=SKIP),
+        "sold_date": Coalesce(("soldDate", T, to_datetime), default=SKIP),
+        "latitude": "latitude",
+        "longitude": "longitude",
+        "url": "url",
+    }
+    data = glom(data, spec)
+    data = extract_digits(
+        ["sold_price_absolute_diff", "list_price"],
+        data,
+        float,
+    )
+    data["url"] = "https://www.booli.se" + data["url"]
+    merged = data | data_points
+    return merged
+
+
+def clean_sales(sales):
+    to_datetime = lambda s: datetime.strptime(s, "%Y-%m-%d")
+    spec = {
+        "id": ("id", T, int),
+        "agent": "agent",
+        "agency": "agency",
+        "sold_price": "soldPrice.raw",
+        "sold_price_absolute_diff": Coalesce(
+            "soldPriceAbsoluteDiff.formatted", default=SKIP
+        ),
+        "sold_price_percentage_diff": Coalesce(
+            "soldPricePercentageDiff.raw", default=SKIP
+        ),
+        "sold_date": Coalesce(("soldDate", T, to_datetime), default=SKIP),
+        "url": "url",
+    }
+    sales = glom(sales, spec)
+    sales["url"] = "https://www.booli.se" + sales["url"]
+    sales["agent"].pop("__typename", None)
+    sales["agency"].pop("__typename", None)
+    sales = extract_digits(
+        ["sold_price_absolute_diff"],
+        sales,
+        float,
+    )
+    return sales
+
+
+def mongodb_load_meta():
+    mongo_uri = "mongodb://root:root@localhost:27017/"
+    db_name = "booli"
+    client = None
+    try:
+        client = MongoClient(mongo_uri)
+        db = client[db_name]
+        collection = db["sold"]
+        result = collection.find_one({"_id": "meta"})
+        return result
+    finally:
+        if client:
+            client.close()
+
+
+def mongodb_save(documents, collection):
+    mongo_uri = "mongodb://root:root@localhost:27017/"
+    db_name = "booli"
+    client = None
+    try:
+        client = MongoClient(mongo_uri)
+        db = client[db_name]
+        collection = db[collection]
+        for doc in documents:
+            filter_query = {"_id": doc["_id"]}
+            update_query = {
+                "$set": doc
+            }  # Use $set to update or insert the entire document
+            result = collection.update_one(filter_query, update_query, upsert=True)
+            console.print(
+                f"Document with _id: [cyan]{doc['_id']}[/cyan] upserted: {result.acknowledged}"
+            )
+    finally:
+        if client:
+            client.close()
+
+
+def json_serial(obj):
+    """JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError("Type not serializable")
+
+
+def fetch_page(page: int, client: httpx.Client, start_date: str, end_date: str):
+    console.print(f"Fetching page {page}...", style="blue")
+
+    response_json = graphql_listings(
+        client, start_date=start_date, end_date=end_date, page=page
+    )
+
+    data_value = glom(response_json, "data", default=None)
+    if data_value is None:
+        console.print(
+            f"[bold yellow]Termination condition met on page {page}: 'data' is null. Stopping.[/bold yellow]"
+        )
+        return False
+
+    results = glom(response_json, "data.sold.result", default=[])
+    console.print(
+        f"[green]✓ Successfully fetched page {page}. Found {len(results)} items.[/green]"
+    )
+
+    with open("not_processed.json", "w", encoding="utf-8") as file:
+        json.dump(results, file, indent=4, ensure_ascii=False)
+
+    documents = []
+    for sold in results:
+        clean = clean_data(sold)
+        sales = glom(
+            graphql_sales_of_property(client, clean["_id"]),
+            "data.salesOfProperty",
+            default=[],
+        )
+        sales = [clean_sales(s) for s in sales]
+        clean["sales"] = sales
+        documents.append(clean)
+
+    mongodb_save(documents, "sold")
+    return True
+
+
+# def debugging():
+#     with httpx.Client(timeout=30.0) as client:
+#         console.print(graphql_sales_of_property(client, 5510056))
+
+
+def main():
+    # debugging()
+    meta = mongodb_load_meta()
+    if not meta:
+        console.print("[bold red]Failed to load metadata[/bold red]")
+        return
+    start_date = meta["last_update"].strftime("%Y-%m-%d")
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    console.print(
+        f"Scraping from [cyan]{start_date}[/cyan] to [cyan]{end_date}[/cyan]",
+        style="blue",
+    )
+
+    # Use a single client for connection pooling
+    page = 1
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            while True:
+                more = fetch_page(
+                    page, client, start_date=start_date, end_date=end_date
+                )
+                if not more:
+                    break
+                page += 1
+                time.sleep(2)
+            console.print(
+                f"[bold green]Finished scraping all [cyan]{page}[/cyan] pages.[/bold green]"
+            )
+
+    except httpx.HTTPStatusError as e:
+        console.print(
+            f"[bold red]HTTP Error on page {page}: {e.response.status_code}[/bold red]"
+        )
+        console.print_exception(show_locals=True)
+    except GlomError as e:
+        console.print(f"[bold red]JSON Parsing Error on page {page}:[/bold red]")
+        console.print_exception(show_locals=True)
+    except Exception as e:
+        console.print(
+            f"[bold red]An unexpected error occurred on page {page}:[/bold red]"
+        )
+        console.print_exception(show_locals=True)
+
+
+if __name__ == "__main__":
+    main()

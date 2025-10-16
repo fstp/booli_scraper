@@ -6,3 +6,6 @@ connect_to_mongo:
 
 start_jupyter:
   . venv/bin/activate && jupyter lab --no-browser --port=8888 --notebook-dir=./notebooks
+
+start_mongo:
+  cd docker && docker compose up -d
