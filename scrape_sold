@@ -61,6 +61,35 @@ def graphql_listings(client: httpx.Client, start_date: str, end_date: str, page:
     }
     response = client.get(base_url, headers=headers, params=params)
     response.raise_for_status()
+
+    if response.status_code == 202:
+        console.print(
+            f"⏰ HTTP 202 Accepted received for listings query on [cyan]{page}[/cyan], back off and try again",
+            style="yellow",
+        )
+        max_attempts = 10
+
+        for attempt in range(max_attempts):
+            time.sleep(120)
+            console.print(
+                f"📨 Retrying listings query attempt ({attempt+1}/{max_attempts}) on [cyan]{page}[/cyan]...",
+                style="blue",
+            )
+            response = client.get(base_url, headers=headers, params=params)
+            response.raise_for_status()
+            if response.status_code != 202:
+                console.print(
+                    f"✓ Successful listings query for [cyan]{page}[/cyan].",
+                    style="green",
+                )
+                return response.json()
+
+        # TODO: Maybe add retry logic here, abort if we reach max attempts
+        console.print(
+            f"❌ Failed listings query on [cyan]{page}[/cyan].", style="bold red"
+        )
+        raise httpx.TimeoutException("Timeout during listings query")
+
     return response.json()
 
 
@@ -93,7 +122,7 @@ def graphql_sales_of_property(client: httpx.Client, id: int):
         for attempt in range(max_attempts):
             time.sleep(120)
             console.print(
-                f"📨 Retrying sales query attempt {attempt+1} on [cyan]{id}[/cyan]...",
+                f"📨 Retrying sales query attempt ({attempt+1}/{max_attempts}) on [cyan]{id}[/cyan]...",
                 style="blue",
             )
             response = client.get(base_url, headers=headers, params=params)
@@ -113,11 +142,12 @@ def graphql_sales_of_property(client: httpx.Client, id: int):
 
 def try_extract_data(point):
     zero_float = lambda _: 0.0
+
     def sum_numbers(match_text):
         # Handle "number+number" format, convert to integers and sum
         console.print(f"Summing numbers in '{match_text}'", style="blue")
-        if '+' in match_text:
-            numbers = match_text.split('+')
+        if "+" in match_text:
+            numbers = match_text.split("+")
             return float(sum(float(num) for num in numbers))
         return float(match_text)
 
@@ -142,16 +172,18 @@ def try_extract_data(point):
 def extract_data_points(data):
     points = glom(data, ("displayAttributes.dataPoints", ["value.plainText"]))
     points = [p.replace("\xa0", " ").replace(" ", "").replace(",", ".") for p in points]
-    console.print(points)
+    # console.print(points)
 
     result = dict()
     for p in points:
         result = result | try_extract_data(p)
 
     if len(result) == 0:
-        console.print(f"[bold red]❗Failed to extract any data points[/bold red]")
+        console.print(
+            f"[bold red]Failed to extract any data points[/bold red]: {points}"
+        )
 
-    console.print(result)
+    # console.print(result)
     return result
 
 
@@ -207,8 +239,8 @@ def clean_sales(sales):
     to_datetime = lambda s: datetime.strptime(s, "%Y-%m-%d")
     spec = {
         "id": ("id", T, int),
-        "agent": "agent",
-        "agency": "agency",
+        "agent": Coalesce("agent", default=SKIP),
+        "agency": Coalesce("agency", default=SKIP),
         "sold_price": "soldPrice.raw",
         "sold_price_absolute_diff": Coalesce(
             "soldPriceAbsoluteDiff.formatted", default=SKIP
@@ -220,9 +252,14 @@ def clean_sales(sales):
         "url": "url",
     }
     sales = glom(sales, spec)
+
+    sales = {k: v for k, v in sales.items() if v is not None}
     sales["url"] = "https://www.booli.se" + sales["url"]
-    sales["agent"].pop("__typename", None)
-    sales["agency"].pop("__typename", None)
+    if "agent" in sales:
+        sales["agent"].pop("__typename", None)
+    if "agency" in sales:
+        sales["agency"].pop("__typename", None)
+
     sales = extract_digits(
         ["sold_price_absolute_diff"],
         sales,
@@ -278,14 +315,27 @@ def json_serial(obj):
 def fetch_page(page: int, client: httpx.Client, start_date: str, end_date: str):
     console.print(f"Fetching page {page}...", style="blue")
 
-    response_json = graphql_listings(
-        client, start_date=start_date, end_date=end_date, page=page
-    )
+    attempts = 0
+    data_value = None
+    response_json = None
 
-    data_value = glom(response_json, "data", default=None)
+    while attempts < 6:
+        response_json = graphql_listings(
+            client, start_date=start_date, end_date=end_date, page=page
+        )
+        data_value = glom(response_json, "data", default=None)
+        if data_value is not None:
+            break
+        if attempts < 5:
+            console.print(
+                f"[yellow]Data is [cyan]None[/cyan] on page [cyan]{page}[/cyan], retrying in 40 seconds... ({attempts+1}/5)[/yellow]"
+            )
+            time.sleep(40)
+        attempts += 1
+
     if data_value is None:
         console.print(
-            f"[bold yellow]Termination condition met on page {page}: 'data' is null. Stopping.[/bold yellow]"
+            f"[bold yellow]🛑 Termination condition met on page {page}: 'data' is null after retries. Stopping.[/bold yellow]"
         )
         return False
 
@@ -293,6 +343,12 @@ def fetch_page(page: int, client: httpx.Client, start_date: str, end_date: str):
     console.print(
         f"[green]✓ Successfully fetched page {page}. Found {len(results)} items.[/green]"
     )
+
+    if not results:
+        console.print(
+            f"[bold yellow]🛑 Termination condition met on page {page}: no more items. Stopping.[/bold yellow]"
+        )
+        return False
 
     with open("not_processed.json", "w", encoding="utf-8") as file:
         json.dump(results, file, indent=4, ensure_ascii=False)
@@ -313,13 +369,7 @@ def fetch_page(page: int, client: httpx.Client, start_date: str, end_date: str):
     return True
 
 
-# def debugging():
-#     with httpx.Client(timeout=30.0) as client:
-#         console.print(graphql_sales_of_property(client, 5510056))
-
-
 def main():
-    # debugging()
     meta = mongodb_load_meta()
     if not meta:
         console.print("[bold red]Failed to load metadata[/bold red]")
@@ -342,10 +392,11 @@ def main():
                 if not more:
                     break
                 page += 1
-                time.sleep(2)
+                time.sleep(5)
             console.print(
                 f"[bold green]Finished scraping all [cyan]{page}[/cyan] pages.[/bold green]"
             )
+        mongodb_save([{"_id": "meta", "last_update": datetime.now()}], "sold")
 
     except httpx.HTTPStatusError as e:
         console.print(

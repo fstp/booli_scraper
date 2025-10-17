@@ -1,0 +1,11 @@
+#! /usr/bin/env bash
+# vim: ft=sh
+set -eu
+set -o pipefail
+
+curl -sG 'https://www.booli.se/graphql' \
+  -H 'Content-Type: application/json; charset=utf-8' \
+  --data-urlencode 'operationName=search' \
+  --data-urlencode 'variables={"queryContext":"SERP_LIST_LISTING","input":{"filters":[{"key":"maxSoldDate","value":"2025-10-16"},{"key":"minSoldDate","value":"2025-08-26"},{"key":"objectType","value":"Lägenhet"}],"areaId":"2","sort":"","page":1,"ascending":false,"excludeAncestors":true,"facets":["upcomingSale"]}}' \
+  --data-urlencode 'extensions={"persistedQuery":{"version":1,"sha256Hash":"e6afcbda5c671553ce4ac70334362174c136b21eb3cfc1b20104be0b4ea9646c"}}' \
+  | jq '.data.sold.result[]' | bat -l json -p
